@@ -1,49 +1,78 @@
+cat > Jenkinsfile <<'EOF'
 pipeline {
     agent any
+
+    environment {
+        IMAGE_NAME = 'jenkins-redis-demo'
+        TEST_NETWORK = "jenkins-test-net-${BUILD_NUMBER}"
+        REDIS_CONTAINER = "redis-test-${BUILD_NUMBER}"
+        APP_CONTAINER = "app-test-${BUILD_NUMBER}"
+    }
 
     stages {
         stage('Checkout') {
             steps {
-                echo 'Checking out source code...'
+                echo 'Source code already checked out by Jenkins SCM.'
             }
         }
 
         stage('Build Docker Image') {
             steps {
-                sh 'docker build -t jenkins-redis-demo:latest .'
+                sh '''
+                    docker build -t ${IMAGE_NAME}:latest .
+                '''
             }
         }
 
         stage('Test App Container') {
             steps {
                 sh '''
-                docker rm -f redis-test app-test || true
+                    echo "Creating isolated Jenkins test network..."
+                    docker network create ${TEST_NETWORK}
 
-                docker network create redis-demo-net || true
+                    echo "Starting temporary Redis..."
+                    docker run -d \
+                      --name ${REDIS_CONTAINER} \
+                      --network ${TEST_NETWORK} \
+                      redis:7
 
-                docker run -d --name redis-test --network redis-demo-net redis:7
+                    echo "Starting temporary app container..."
+                    docker run -d \
+                      --name ${APP_CONTAINER} \
+                      --network ${TEST_NETWORK} \
+                      -e REDIS_HOST=${REDIS_CONTAINER} \
+                      -e REDIS_PORT=6379 \
+                      ${IMAGE_NAME}:latest
 
-                docker run -d --name app-test \
-                  --network redis-demo-net \
-                  -e REDIS_HOST=redis-test \
-                  -p 5000:5000 \
-                  jenkins-redis-demo:latest
+                    echo "Waiting for app..."
+                    sleep 5
 
-                sleep 5
+                    echo "Testing health endpoint..."
+                    docker exec ${APP_CONTAINER} python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:5000/health').read().decode())"
 
-                curl -f http://localhost:5000/health
-                curl -f http://localhost:5000/
-                '''
-            }
-        }
-
-        stage('Cleanup') {
-            steps {
-                sh '''
-                docker rm -f app-test redis-test || true
-                docker network rm redis-demo-net || true
+                    echo "Testing main endpoint..."
+                    docker exec ${APP_CONTAINER} python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:5000/').read().decode())"
                 '''
             }
         }
     }
+
+    post {
+        always {
+            sh '''
+                echo "Cleaning Jenkins test containers and network..."
+                docker rm -f ${APP_CONTAINER} ${REDIS_CONTAINER} || true
+                docker network rm ${TEST_NETWORK} || true
+            '''
+        }
+
+        success {
+            echo 'Pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Check Console Output.'
+        }
+    }
 }
+EOF
